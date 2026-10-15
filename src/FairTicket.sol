@@ -18,7 +18,7 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
 
     struct Ticket{
         uint256 eventId;
-        uint256 pricepaid;
+        uint256 pricePaid;
         bool used;
     }
 
@@ -30,6 +30,7 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
 
     event EventCreated(uint256 indexed eventId, string name, uint64 date, uint256 price, uint32 maxSeats);
     event TicketPurchased(uint256 indexed eventId, uint256 indexed ticketId, address indexed buyer);
+    event TicketUsed(uint256 indexed ticketId, uint256 indexed eventId, address indexed holder);
 
     bytes32 public constant ORGANIZER_ROLE = keccak256("ORGANIZER_ROLE");
     bytes32 public constant STEWARD_ROLE = keccak256("STEWARD_ROLE");
@@ -68,5 +69,48 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
 
         emit EventCreated(eventId, name, date, price, maxSeats);
     }
+
+
+    function checkIn(uint256 ticketId) external onlyRole(STEWARD_ROLE) {
+        address holder = ownerOf(ticketId); 
+
+        Ticket storage t = tickets[ticketId];
+
+        require(!t.used, "Biglietto gia usato");
+        require(!events[t.eventId].cancelled, "Evento annullato");
+
+        t.used = true;
+
+        emit TicketUsed(ticketId, t.eventId, holder);
+    }
+
+    function buyTicket(uint256 eventId)
+    external
+    payable
+    nonReentrant
+    returns (uint256 ticketId)
+{
+    SportEvent storage ev = events[eventId];
+
+    require(ev.date != 0, "Evento inesistente");
+    require(!ev.cancelled, "Evento annullato");
+    require(block.timestamp < ev.date, "Evento iniziato");
+    require(ev.sold < ev.maxSeats, "Sold out");
+    require(msg.value == ev.price, "Prezzo errato");
+
+    ev.sold++;
+
+    ticketId = _nextTicketId++;
+    tickets[ticketId] = Ticket({
+        eventId: eventId,
+        pricePaid: msg.value,
+        used: false
+    });
+
+    emit TicketPurchased(eventId, ticketId, msg.sender);
+    
+    _safeMint(msg.sender, ticketId);
+
+}
 
 }
