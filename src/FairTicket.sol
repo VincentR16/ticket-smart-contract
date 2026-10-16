@@ -38,13 +38,17 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
 
     bool private _authorizedTransfer;
 
-    event EventCreated(uint256 indexed eventId, string name, uint64 date, uint256 price, uint32 maxSeats, address organizer);
+    event EventCreated(
+        uint256 indexed eventId, string name, uint64 date, uint256 price, uint32 maxSeats, address organizer
+    );
     event EventCancelled(uint256 indexed eventId);
     event TicketPurchased(uint256 indexed eventId, uint256 indexed ticketId, address indexed buyer);
     event TicketUsed(uint256 indexed ticketId, uint256 indexed eventId, address indexed holder);
     event TicketTransfered(uint256 indexed ticketId, address indexed oldHolder, address indexed newHolder);
     event ResellList(uint256 indexed eventId, uint256 indexed ticketId, uint256 indexed price, address holder);
-    event ResellTicketSold(uint256 indexed eventId, uint256 indexed ticketId, uint256 price, address oldHolder, address indexed newHolder);
+    event ResellTicketSold(
+        uint256 indexed eventId, uint256 indexed ticketId, uint256 price, address oldHolder, address indexed newHolder
+    );
     event DeleteResellList(uint256 indexed ticketId, address holder);
     event TicketRefund(uint256 indexed ticketId, address indexed holder);
     event RevenueClaimed(uint256 indexed eventId, address indexed organizer, uint256 amount);
@@ -55,12 +59,7 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
         _grantRole(ORGANIZER_ROLE, msg.sender);
     }
 
-    function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        override(ERC721, AccessControl)
-        returns (bool)
-    {
+    function supportsInterface(bytes4 interfaceId) public view override(ERC721, AccessControl) returns (bool) {
         return super.supportsInterface(interfaceId);
     }
 
@@ -75,14 +74,8 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
 
         eventId = _nextEventId++;
 
-        events[eventId] = SportEvent({
-            name: name,
-            date: date,
-            price: price,
-            maxSeats: maxSeats,
-            sold: 0,
-            cancelled: false
-        });
+        events[eventId] =
+            SportEvent({name: name, date: date, price: price, maxSeats: maxSeats, sold: 0, cancelled: false});
 
         eventOrganizer[eventId] = msg.sender;
 
@@ -232,11 +225,7 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
         emit Withdrawal(msg.sender, amount);
     }
 
-    function _transferableTicket(uint256 ticketId)
-        internal
-        view
-        returns (SportEvent storage ev, Ticket storage tick)
-    {
+    function _transferableTicket(uint256 ticketId) internal view returns (SportEvent storage ev, Ticket storage tick) {
         tick = tickets[ticketId];
         ev = events[tick.eventId];
 
@@ -245,11 +234,7 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
         require(block.timestamp < ev.date, "Event already began");
     }
 
-    function _update(address to, uint256 tokenId, address auth)
-        internal
-        override
-        returns (address)
-    {
+    function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
         address from = _ownerOf(tokenId);
 
         if (from != address(0)) {
