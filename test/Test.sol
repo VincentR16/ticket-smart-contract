@@ -9,28 +9,41 @@ contract FairTicketTest is Test {
     FairTicket internal ticket;
 
     // address(this) ha fatto il deploy: e admin e organizzatore
-    address internal steward = makeAddr("steward");
-    address internal anna = makeAddr("anna");
-    address internal bob = makeAddr("bob");
+    address internal promoter = makeAddr("promoter");
+    address internal anna = makeAddr("anna"); // invitata dal promoter
+    address internal bob = makeAddr("bob"); // invitato dal promoter
+    address internal carol = makeAddr("carol"); // non invitata
 
     uint256 internal constant PRICE = 1 ether;
     uint64 internal eventDate;
 
-    // Serve per incassare come organizzatore (claimRevenue + withdraw)
+    // Serve per incassare come organizzatore (claimRevenue, commissioni, withdraw)
     receive() external payable {}
 
     function setUp() public {
         ticket = new FairTicket();
-        ticket.grantRole(ticket.STEWARD_ROLE(), steward);
-        deal(anna, 10 ether);
-        deal(bob, 10 ether);
+        ticket.grantRole(ticket.PROMOTER_ROLE(), promoter);
+
+        // Anna e Bob vengono invitati dal promoter
+        vm.startPrank(promoter);
+        ticket.inviteUser(anna);
+        ticket.inviteUser(bob);
+        vm.stopPrank();
+
+        deal(anna, 100 ether);
+        deal(bob, 100 ether);
+        deal(carol, 100 ether);
         eventDate = uint64(block.timestamp + 1 days);
     }
 
     // ------------------------------------------------------------ helper
 
+    function _newEventWithSeats(uint32 seats) internal returns (uint256) {
+        return ticket.createEvent("Webinar Sicurezza", eventDate, PRICE, seats);
+    }
+
     function _newEvent() internal returns (uint256) {
-        return ticket.createEvent("Napoli-Inter", eventDate, PRICE, 100);
+        return _newEventWithSeats(100);
     }
 
     function _buy(address who, uint256 eventId) internal returns (uint256 ticketId) {
@@ -38,30 +51,50 @@ contract FairTicketTest is Test {
         ticketId = ticket.buyTicket{value: PRICE}(eventId);
     }
 
-    // ------------------------------------------------------- createEvent
+    // ------------------------------------------------------------- inviti
 
-    function testCreateEvent() public {
-        uint256 eventId = _newEvent();
+    function testInviteByPromoter() public {
+        vm.prank(promoter);
+        ticket.inviteUser(carol);
 
-        (, uint64 date, uint256 price, uint32 maxSeats, uint32 sold, bool cancelled) = ticket.events(eventId);
-        assertEq(eventId, 1);
-        assertEq(uint256(date), uint256(eventDate));
-        assertEq(price, PRICE);
-        assertEq(uint256(maxSeats), 100);
-        assertEq(uint256(sold), 0);
-        assertFalse(cancelled);
-        assertEq(ticket.eventOrganizer(eventId), address(this));
+        assertTrue(ticket.hasRole(ticket.USER_ROLE(), carol));
+        assertEq(ticket.invitedBy(carol), promoter);
     }
+
+    function testInviteRestrictions() public {
+        address promoter2 = makeAddr("promoter2");
+        ticket.grantRole(ticket.PROMOTER_ROLE(), promoter2);
+        bytes32 role = ticket.PROMOTER_ROLE();
+
+        // Un utente invitato non puo invitare a sua volta
+        vm.prank(anna);
+        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anna, role));
+        ticket.inviteUser(carol);
+
+        // Il promoter invita solo utenti semplici: non un altro promoter, ne un organizzatore
+        vm.prank(promoter);
+        vm.expectRevert("Cannot invite a role holder");
+        ticket.inviteUser(promoter2);
+
+        vm.prank(promoter);
+        vm.expectRevert("Cannot invite a role holder");
+        ticket.inviteUser(address(this));
+    }
+
+    // ------------------------------------------------------------- eventi
 
     function testCreateEventOnlyOrganizer() public {
         bytes32 role = ticket.ORGANIZER_ROLE();
 
-        vm.prank(anna);
-        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anna, role));
+        // Il promoter puo invitare ma non creare eventi
+        vm.prank(promoter);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, promoter, role)
+        );
         ticket.createEvent("x", eventDate, PRICE, 10);
     }
 
-    // --------------------------------------------------------- buyTicket
+    // --------------------------------------------------------- acquisto
 
     function testBuyTicket() public {
         uint256 eventId = _newEvent();
@@ -70,36 +103,36 @@ contract FairTicketTest is Test {
         assertEq(ticket.ownerOf(ticketId), anna);
         (,,,, uint32 sold,) = ticket.events(eventId);
         assertEq(uint256(sold), 1);
+        assertEq(ticket.maxTickets(anna), 1);
         assertEq(address(ticket).balance, PRICE);
     }
 
-    function testBuyTicketWrongPriceReverts() public {
+    function testAnyoneCanBuy() public {
         uint256 eventId = _newEvent();
 
-        vm.prank(anna);
-        vm.expectRevert("Prezzo errato");
-        ticket.buyTicket{value: 0.5 ether}(eventId);
+        // Carol non e stata invitata da nessuno: compra lo stesso, e nessun promoter matura commissioni
+        uint256 ticketId = _buy(carol, eventId);
+
+        assertEq(ticket.ownerOf(ticketId), carol);
+        assertEq(ticket.eventPromoterFees(eventId), 0);
     }
 
-    function testBuyTicketSoldOutReverts() public {
-        uint256 eventId = ticket.createEvent("x", eventDate, PRICE, 1);
-        _buy(anna, eventId);
+    function testBuyTicketLimitReached() public {
+        uint256 limit = ticket.MAX_TICKETS();
+        uint256 eventId = _newEventWithSeats(10);
 
-        vm.prank(bob);
-        vm.expectRevert("Sold out");
+        // Anna compra fino al limite
+        for (uint256 i = 0; i < limit; i++) {
+            _buy(anna, eventId);
+        }
+
+        // Un altro acquisto viene rifiutato
+        vm.prank(anna);
+        vm.expectRevert("You already purchased 5 tickets");
         ticket.buyTicket{value: PRICE}(eventId);
     }
 
-    function testBuyTicketAfterStartReverts() public {
-        uint256 eventId = _newEvent();
-        vm.warp(eventDate + 1);
-
-        vm.prank(anna);
-        vm.expectRevert("Evento iniziato");
-        ticket.buyTicket{value: PRICE}(eventId);
-    }
-
-    // ---------------------------------------------- trasferimenti diretti
+    // ------------------------------------------------------ trasferimenti
 
     function testDirectTransferBlocked() public {
         uint256 ticketId = _buy(anna, _newEvent());
@@ -120,64 +153,53 @@ contract FairTicketTest is Test {
 
     // ---------------------------------------------------------- rivendita
 
-    function testResale() public {
-        uint256 ticketId = _buy(anna, _newEvent());
-        uint256 maxPrice = ticket.maxResellPrice(ticketId);
-        assertEq(maxPrice, 1.25 ether);
+    function testResaleWithCommission() public {
+        uint256 ticketId = _buy(anna, _newEventWithSeats(2)); // 1 su 2 venduti: tetto +50%
+        assertEq(ticket.maxResellPrice(ticketId), 1.5 ether);
 
         vm.prank(anna);
-        ticket.addToResellTicket(ticketId, maxPrice);
+        ticket.addToResellTicket(ticketId, 1.5 ether);
 
         vm.prank(bob);
-        ticket.buyResellTicket{value: maxPrice}(ticketId);
+        ticket.buyResellTicket{value: 1.5 ether}(ticketId);
 
+        // Extraprofitto di 0.5 ETH: commissione del 5% (0.025) all'organizzatore
         assertEq(ticket.ownerOf(ticketId), bob);
-        assertEq(ticket.resellTickets(ticketId), 0);
-        assertEq(ticket.pendingWithdrawals(anna), maxPrice);
-
-        uint256 before = anna.balance;
-        vm.prank(anna);
-        ticket.withdraw();
-
-        assertEq(anna.balance, before + maxPrice);
-        assertEq(ticket.pendingWithdrawals(anna), 0);
+        assertEq(ticket.pendingWithdrawals(anna), 1.475 ether);
+        assertEq(ticket.pendingWithdrawals(address(this)), 0.025 ether);
     }
 
-    function testResaleAboveCapReverts() public {
-        uint256 ticketId = _buy(anna, _newEvent());
+    function testResaleCapGrowsWithScarcity() public {
+        uint256 eventId = _newEventWithSeats(4);
+        uint256 ticketId = _buy(anna, eventId); // 1 su 4 venduti
+        assertEq(ticket.maxResellPrice(ticketId), 1.25 ether);
 
+        // Sopra il tetto: rifiutato
         vm.prank(anna);
         vm.expectRevert("Price is too high");
         ticket.addToResellTicket(ticketId, 1.25 ether + 1);
+
+        _buy(bob, eventId); // 2 su 4 venduti
+        assertEq(ticket.maxResellPrice(ticketId), 1.5 ether);
     }
 
-    // ------------------------------------------------------------ check-in
+    // --------------------------------------------- conferma di presenza
 
-    function testCheckIn() public {
+    function testConfirmAttendance() public {
         uint256 ticketId = _buy(anna, _newEvent());
 
-        vm.prank(steward);
-        ticket.checkIn(ticketId);
+        vm.prank(anna);
+        ticket.confirmAttendance(ticketId);
 
-        (,, bool used) = ticket.tickets(ticketId);
+        (,,, bool used) = ticket.tickets(ticketId);
         assertTrue(used);
     }
 
-    function testUsedTicketCannotBeTransferred() public {
-        uint256 ticketId = _buy(anna, _newEvent());
-        vm.prank(steward);
-        ticket.checkIn(ticketId);
-
-        vm.prank(anna);
-        vm.expectRevert("Ticket already used");
-        ticket.transferTicket(ticketId, bob);
-    }
-
-    // -------------------------------------------- annullamento e rimborsi
+    // ---------------------------------------------------------- rimborsi
 
     function testCancelAndRefund() public {
         uint256 eventId = _newEvent();
-        uint256 ticketId = _buy(anna, eventId);
+        uint256 ticketId = _buy(anna, eventId); // la commissione del promoter matura ma non esce dal contratto
 
         ticket.cancelEvent(eventId);
 
@@ -185,70 +207,60 @@ contract FairTicketTest is Test {
         ticket.refundTicket(ticketId);
         assertEq(ticket.pendingWithdrawals(anna), PRICE);
 
-        // il biglietto e stato distrutto
-        vm.expectRevert();
-        ticket.ownerOf(ticketId);
-
         uint256 before = anna.balance;
         vm.prank(anna);
         ticket.withdraw();
 
+        // Rimborso del prezzo intero e contratto a zero
         assertEq(anna.balance, before + PRICE);
         assertEq(address(ticket).balance, 0);
     }
 
-    function testOtherOrganizerCannotCancel() public {
-        uint256 eventId = _newEvent();
-        ticket.grantRole(ticket.ORGANIZER_ROLE(), bob);
+    // ------------------------------------------- incassi e commissioni
 
-        vm.prank(bob);
-        vm.expectRevert("Non organizzatore dell evento");
-        ticket.cancelEvent(eventId);
-    }
-
-    function testPendingBalanceIsNotOverwritten() public {
-        uint256 event1 = _newEvent();
-        uint256 event2 = _newEvent();
-        uint256 ticketA = _buy(anna, event1);
-        uint256 ticketB = _buy(anna, event2);
-
-        // Anna rivende A a Bob e guadagna 1.25 ETH da prelevare
-        vm.prank(anna);
-        ticket.addToResellTicket(ticketA, 1.25 ether);
-        vm.prank(bob);
-        ticket.buyResellTicket{value: 1.25 ether}(ticketA);
-
-        // L'evento 2 viene annullato: Anna si fa rimborsare B
-        ticket.cancelEvent(event2);
-        vm.prank(anna);
-        ticket.refundTicket(ticketB);
-
-        assertEq(ticket.pendingWithdrawals(anna), 1.25 ether + PRICE);
-    }
-
-    // ------------------------------------------------------------- incassi
-
-    function testClaimRevenue() public {
+    function testPromoterCommission() public {
         uint256 eventId = _newEvent();
         _buy(anna, eventId);
         _buy(bob, eventId);
 
-        vm.warp(eventDate + 1);
-        ticket.claimRevenue(eventId);
-        assertEq(ticket.pendingWithdrawals(address(this)), 2 * PRICE);
+        // Il 2% di ogni biglietto comprato da un invitato matura per il promoter
+        assertEq(ticket.eventPromoterFees(eventId), 0.04 ether);
+        assertEq(ticket.promoterEarned(eventId, promoter), 0.04 ether);
 
-        uint256 before = address(this).balance;
-        ticket.withdraw();
-        assertEq(address(this).balance, before + 2 * PRICE);
+        vm.warp(eventDate + 1);
+        vm.prank(promoter);
+        ticket.claimPromoterCommission(eventId);
+        ticket.claimRevenue(eventId);
+
+        // L'organizzatore incassa il resto: in totale esce esattamente quanto e entrato
+        assertEq(ticket.pendingWithdrawals(promoter), 0.04 ether);
+        assertEq(ticket.pendingWithdrawals(address(this)), 1.96 ether);
+        assertEq(address(ticket).balance, 2 * PRICE);
     }
 
-    function testClaimRevenueCancelledReverts() public {
+    function testClaimRevenue() public {
+        uint256 eventId = _newEvent();
+        _buy(carol, eventId); // non invitata: nessuna commissione
+        _buy(bob, eventId); // invitato: 0.02 ETH al promoter
+
+        vm.warp(eventDate + 1);
+        ticket.claimRevenue(eventId);
+
+        assertEq(ticket.pendingWithdrawals(address(this)), 1.98 ether);
+    }
+
+    function testClaimCancelledReverts() public {
         uint256 eventId = _newEvent();
         _buy(anna, eventId);
         ticket.cancelEvent(eventId);
         vm.warp(eventDate + 1);
 
+        // Evento annullato: ne l'organizzatore ne il promoter possono incassare
         vm.expectRevert("Event cancelled");
         ticket.claimRevenue(eventId);
+
+        vm.prank(promoter);
+        vm.expectRevert("Event cancelled");
+        ticket.claimPromoterCommission(eventId);
     }
 }

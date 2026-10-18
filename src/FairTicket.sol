@@ -7,11 +7,20 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
     bytes32 public constant ORGANIZER_ROLE = keccak256("ORGANIZER_ROLE");
-    bytes32 public constant STEWARD_ROLE = keccak256("STEWARD_ROLE");
+    bytes32 public constant PROMOTER_ROLE = keccak256("PROMOTER_ROLE");
+    bytes32 public constant USER_ROLE = keccak256("USER_ROLE");
 
-    uint256 public constant MAX_MARKUP_PERCENT = 25;
+    uint256 private constant BPS = 10_000;
 
-    struct SportEvent {
+    uint256 public constant MAX_MARKUP_BPS = 10_000;
+
+    // Commissione dell'organizzatore sull'extraprofitto di una rivendita
+    uint256 public constant COMMISSION_PERCENT = 5;
+    // Commissione del promoter sul prezzo dei biglietti comprati dai suoi invitati
+    uint256 public constant PROMOTER_COMMISSION_PERCENT = 2;
+    uint256 public constant MAX_TICKETS = 5;
+
+    struct DigitalEvent {
         string name;
         uint64 date;
         uint256 price;
@@ -23,31 +32,48 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
     struct Ticket {
         uint256 eventId;
         uint256 pricePaid;
+        uint256 lastPaid;
         bool used;
     }
 
-    mapping(uint256 => SportEvent) public events;
+    mapping(uint256 => DigitalEvent) public events;
     mapping(uint256 => Ticket) public tickets;
     mapping(uint256 => address) public eventOrganizer;
     mapping(uint256 => uint256) public resellTickets;
     mapping(address => uint256) public pendingWithdrawals;
     mapping(uint256 => bool) public revenueClaimed;
+    mapping(address => address) public invitedBy;
+    mapping(address => uint256) public maxTickets;
+    // evento => totale delle commissioni maturate dai promoter (da togliere all'incasso dell'organizzatore)
+    mapping(uint256 => uint256) public eventPromoterFees;
+    // evento => promoter => commissione maturata e non ancora incassata
+    mapping(uint256 => mapping(address => uint256)) public promoterEarned;
 
     uint256 private _nextEventId = 1;
     uint256 private _nextTicketId = 1;
 
     bool private _authorizedTransfer;
 
+    event UserInvited(address indexed user, address indexed inviter);
     event EventCreated(
         uint256 indexed eventId, string name, uint64 date, uint256 price, uint32 maxSeats, address organizer
     );
     event EventCancelled(uint256 indexed eventId);
     event TicketPurchased(uint256 indexed eventId, uint256 indexed ticketId, address indexed buyer);
-    event TicketUsed(uint256 indexed ticketId, uint256 indexed eventId, address indexed holder);
+    event PromoterCommissionAccrued(
+        uint256 indexed eventId, address indexed promoter, address indexed buyer, uint256 amount
+    );
+    event PromoterCommissionClaimed(uint256 indexed eventId, address indexed promoter, uint256 amount);
+    event AttendanceConfirmed(uint256 indexed ticketId, uint256 indexed eventId, address indexed holder);
     event TicketTransfered(uint256 indexed ticketId, address indexed oldHolder, address indexed newHolder);
     event ResellList(uint256 indexed eventId, uint256 indexed ticketId, uint256 indexed price, address holder);
     event ResellTicketSold(
-        uint256 indexed eventId, uint256 indexed ticketId, uint256 price, address oldHolder, address indexed newHolder
+        uint256 indexed eventId,
+        uint256 indexed ticketId,
+        uint256 price,
+        uint256 commission,
+        address oldHolder,
+        address indexed newHolder
     );
     event DeleteResellList(uint256 indexed ticketId, address holder);
     event TicketRefund(uint256 indexed ticketId, address indexed holder);
@@ -63,6 +89,23 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
         return super.supportsInterface(interfaceId);
     }
 
+    // Solo i promoter invitano, e solo utenti semplici: chi ha gia un ruolo (organizzatore,
+    // promoter, admin) non si invita. L'invitato puo comprare come tutti gli altri, ma sui
+    // suoi acquisti il promoter che l'ha invitato matura una commissione.
+    function inviteUser(address user) external onlyRole(PROMOTER_ROLE) {
+        require(user != address(0) && user != msg.sender, "Address not valid");
+        require(
+            !hasRole(ORGANIZER_ROLE, user) && !hasRole(PROMOTER_ROLE, user) && !hasRole(DEFAULT_ADMIN_ROLE, user),
+            "Cannot invite a role holder"
+        );
+        require(!hasRole(USER_ROLE, user), "User already invited");
+
+        _grantRole(USER_ROLE, user);
+        invitedBy[user] = msg.sender;
+
+        emit UserInvited(user, msg.sender);
+    }
+
     function createEvent(string calldata name, uint64 date, uint256 price, uint32 maxSeats)
         external
         onlyRole(ORGANIZER_ROLE)
@@ -75,7 +118,7 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
         eventId = _nextEventId++;
 
         events[eventId] =
-            SportEvent({name: name, date: date, price: price, maxSeats: maxSeats, sold: 0, cancelled: false});
+            DigitalEvent({name: name, date: date, price: price, maxSeats: maxSeats, sold: 0, cancelled: false});
 
         eventOrganizer[eventId] = msg.sender;
 
@@ -83,7 +126,7 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
     }
 
     function cancelEvent(uint256 eventId) external onlyRole(ORGANIZER_ROLE) {
-        SportEvent storage ev = events[eventId];
+        DigitalEvent storage ev = events[eventId];
 
         require(ev.date != 0, "Evento inesistente");
         require(!ev.cancelled, "Evento cancellato");
@@ -95,32 +138,49 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
         emit EventCancelled(eventId);
     }
 
-    function checkIn(uint256 ticketId) external onlyRole(STEWARD_ROLE) {
-        address holder = ownerOf(ticketId);
+    function confirmAttendance(uint256 ticketId) external {
+        require(ownerOf(ticketId) == msg.sender, "You are not the owner");
 
         Ticket storage t = tickets[ticketId];
+        DigitalEvent storage ev = events[t.eventId];
 
-        require(!t.used, "Biglietto gia usato");
-        require(!events[t.eventId].cancelled, "Evento annullato");
+        require(!t.used, "Attendance already confirmed");
+        require(!ev.cancelled, "Evento annullato");
+        require(block.timestamp < ev.date, "Evento iniziato");
 
         t.used = true;
+        delete resellTickets[ticketId];
 
-        emit TicketUsed(ticketId, t.eventId, holder);
+        emit AttendanceConfirmed(ticketId, t.eventId, msg.sender);
     }
 
     function buyTicket(uint256 eventId) external payable nonReentrant returns (uint256 ticketId) {
-        SportEvent storage ev = events[eventId];
+        DigitalEvent storage ev = events[eventId];
 
         require(ev.date != 0, "Evento inesistente");
         require(!ev.cancelled, "Evento annullato");
         require(block.timestamp < ev.date, "Evento iniziato");
         require(ev.sold < ev.maxSeats, "Sold out");
         require(msg.value == ev.price, "Prezzo errato");
+        require(maxTickets[msg.sender] < MAX_TICKETS, "You already purchased 5 tickets");
 
         ev.sold++;
 
         ticketId = _nextTicketId++;
-        tickets[ticketId] = Ticket({eventId: eventId, pricePaid: msg.value, used: false});
+        tickets[ticketId] = Ticket({eventId: eventId, pricePaid: msg.value, lastPaid: msg.value, used: false});
+        maxTickets[msg.sender]++;
+
+        // Se l'acquirente e stato invitato da un promoter (che ha ancora il ruolo), il promoter
+        // matura il 2% del prezzo. I soldi restano nel contratto fino alla fine dell'evento: se
+        // l'evento viene annullato servono per rimborsare il prezzo intero.
+        address promoter = invitedBy[msg.sender];
+        if (promoter != address(0) && hasRole(PROMOTER_ROLE, promoter)) {
+            uint256 fee = (ev.price * PROMOTER_COMMISSION_PERCENT) / 100;
+            promoterEarned[eventId][promoter] += fee;
+            eventPromoterFees[eventId] += fee;
+
+            emit PromoterCommissionAccrued(eventId, promoter, msg.sender, fee);
+        }
 
         emit TicketPurchased(eventId, ticketId, msg.sender);
 
@@ -141,7 +201,14 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
     }
 
     function maxResellPrice(uint256 ticketId) public view returns (uint256) {
-        return (tickets[ticketId].pricePaid * (100 + MAX_MARKUP_PERCENT)) / 100;
+        Ticket storage tick = tickets[ticketId];
+        DigitalEvent storage ev = events[tick.eventId];
+
+        if (ev.maxSeats == 0) return 0;
+
+        uint256 markupBps = (MAX_MARKUP_BPS * ev.sold) / ev.maxSeats;
+
+        return (tick.pricePaid * (BPS + markupBps)) / BPS;
     }
 
     function addToResellTicket(uint256 ticketId, uint256 price) external {
@@ -167,20 +234,28 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
 
     function buyResellTicket(uint256 ticketId) external payable nonReentrant {
         address seller = ownerOf(ticketId);
+        uint256 price = resellTickets[ticketId];
 
-        require(resellTickets[ticketId] != 0, "Ticket not for sale");
+        require(price != 0, "Ticket not for sale");
         require(msg.sender != seller, "You cannot buy this ticket");
-        require(msg.value == resellTickets[ticketId], "Value not correct");
+        require(msg.value == price, "Value not correct");
 
         (, Ticket storage tick) = _transferableTicket(ticketId);
 
-        pendingWithdrawals[seller] += msg.value;
+        uint256 commission = 0;
+        if (price > tick.lastPaid) {
+            commission = ((price - tick.lastPaid) * COMMISSION_PERCENT) / 100;
+        }
+
+        tick.lastPaid = price;
+        pendingWithdrawals[seller] += price - commission;
+        pendingWithdrawals[eventOrganizer[tick.eventId]] += commission;
 
         _authorizedTransfer = true;
         _transfer(seller, msg.sender, ticketId);
         _authorizedTransfer = false;
 
-        emit ResellTicketSold(tick.eventId, ticketId, msg.value, seller, msg.sender);
+        emit ResellTicketSold(tick.eventId, ticketId, price, commission, seller, msg.sender);
     }
 
     function refundTicket(uint256 ticketId) external {
@@ -196,8 +271,9 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
         emit TicketRefund(ticketId, msg.sender);
     }
 
+    // All'organizzatore va il ricavato dei biglietti meno le commissioni dei promoter
     function claimRevenue(uint256 eventId) external {
-        SportEvent storage ev = events[eventId];
+        DigitalEvent storage ev = events[eventId];
 
         require(ev.date != 0, "Event not existing");
         require(msg.sender == eventOrganizer[eventId], "You are not the Organizer for this event");
@@ -207,10 +283,27 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
 
         revenueClaimed[eventId] = true;
 
-        uint256 revenue = ev.price * ev.sold;
+        uint256 revenue = ev.price * ev.sold - eventPromoterFees[eventId];
         pendingWithdrawals[msg.sender] += revenue;
 
         emit RevenueClaimed(eventId, msg.sender, revenue);
+    }
+
+    // Il promoter incassa la sua commissione solo a evento finito e non annullato
+    function claimPromoterCommission(uint256 eventId) external {
+        DigitalEvent storage ev = events[eventId];
+
+        require(ev.date != 0, "Event not existing");
+        require(!ev.cancelled, "Event cancelled");
+        require(block.timestamp > ev.date, "Event not ended yet");
+
+        uint256 amount = promoterEarned[eventId][msg.sender];
+        require(amount > 0, "No commission to claim");
+
+        promoterEarned[eventId][msg.sender] = 0;
+        pendingWithdrawals[msg.sender] += amount;
+
+        emit PromoterCommissionClaimed(eventId, msg.sender, amount);
     }
 
     function withdraw() external nonReentrant {
@@ -219,13 +312,17 @@ contract FairTicket is ERC721, AccessControl, ReentrancyGuard {
 
         pendingWithdrawals[msg.sender] = 0;
 
+        emit Withdrawal(msg.sender, amount);
+
         (bool ok,) = msg.sender.call{value: amount}("");
         require(ok, "Invio fallito");
-
-        emit Withdrawal(msg.sender, amount);
     }
 
-    function _transferableTicket(uint256 ticketId) internal view returns (SportEvent storage ev, Ticket storage tick) {
+    function _transferableTicket(uint256 ticketId)
+        internal
+        view
+        returns (DigitalEvent storage ev, Ticket storage tick)
+    {
         tick = tickets[ticketId];
         ev = events[tick.eventId];
 
